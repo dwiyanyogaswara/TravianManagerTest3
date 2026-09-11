@@ -131,39 +131,15 @@ class FarmAutomationService : Service() {
         startAutomaticVillageRefresh()
     }
 
-    private fun scheduleVillageRefreshForNextRun(countdownStartedAt: Long) {
+    private fun scheduleVillageRefreshForNextRun(nextRunAt: Long) {
         handler.removeCallbacks(delayedVillageRefreshRunnable)
         if (!running) return
-        val refreshAt = countdownStartedAt + 60_000L
+        val refreshAt = nextRunAt - 60_000L
         val delay = (refreshAt - System.currentTimeMillis()).coerceAtLeast(0L)
         scheduledRefreshForNextRun = true
         countdownCyclePending = true
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-            .putLong("countdown_started_at", countdownStartedAt)
-            .apply()
-        logEvent("AUTO REFRESH VILLAGE: dijadwalkan 1 menit SETELAH Countdown dimulai — ${timeFormat.format(Date(refreshAt))}")
+        logEvent("AUTO REFRESH VILLAGE: dijadwalkan 1 menit setelah Countdown dimulai — ${timeFormat.format(Date(refreshAt))}")
         handler.postDelayed(delayedVillageRefreshRunnable, delay)
-    }
-
-    private fun closeAutomaticVillageRefresh(reason: String) {
-        if (!villageRefreshInProgress && villageRefreshClosed) return
-        handler.removeCallbacks(villageRefreshTimeoutRunnable)
-        villageRefreshTimeoutRunnable = null
-        villageRefreshInProgress = false
-        villageRefreshCompleted = true
-        villageRefreshClosed = true
-        villageRefreshInspectInFlight = false
-        try { automationWebView()?.stopLoading() } catch (_: Exception) {}
-        logEvent("AUTO REFRESH VILLAGE: ditutup — $reason")
-        updateNotification("Refresh Village selesai")
-
-        if (running && initialCyclePending) {
-            initialCyclePending = false
-            countdownCyclePending = false
-            handler.post { triggerScheduledCycle() }
-        } else if (running && nextAt > 0L && System.currentTimeMillis() >= nextAt) {
-            handler.post { triggerScheduledCycle() }
-        }
     }
     private val cycleWatchdogRunnable: Runnable = Runnable {
         if (!running) return@Runnable
@@ -279,9 +255,6 @@ class FarmAutomationService : Service() {
 
     private var villageRefreshInProgress = false
     private var villageRefreshCompleted = false
-    private var villageRefreshClosed = true
-    private var villageRefreshStartedAt = 0L
-    private var villageRefreshTimeoutRunnable: Runnable? = null
     private var villageRefreshIndex = 0
     private var villageRefreshRetry = 0
     private var villageRefreshInspectInFlight = false
@@ -380,8 +353,7 @@ class FarmAutomationService : Service() {
                 updateNextRun(delay)
                 // Recovery mempertahankan urutan: countdown -> (1 menit kemudian)
                 // Refresh Village -> countdown berakhir -> cycle.
-                val savedCountdownStartedAt = prefs.getLong("countdown_started_at", (savedNextAt - delay).coerceAtLeast(0L))
-                scheduleVillageRefreshForNextRun(savedCountdownStartedAt)
+                scheduleVillageRefreshForNextRun(nextAt)
             }
         }, 800L)
     }
@@ -448,6 +420,9 @@ class FarmAutomationService : Service() {
                     super.onPageFinished(view, url)
                     if (url == null || !running) return
                     lastAutomationUrl = url
+                    if (villageRefreshInProgress && url.contains("dorf1.php", ignoreCase = true)) {
+                        handler.postDelayed({ inspectAutomaticVillageRefresh() }, 700L)
+                    }
                     handlePageAfterConsent(url, url.lowercase(Locale.US), 0)
                 }
 
@@ -545,9 +520,9 @@ class FarmAutomationService : Service() {
         // Farm List + verifikasi dapat membutuhkan >60 detik untuk banyak village.
         // Watchdog 5 menit mencegah false timeout sebelum Resource Builder sempat jalan.
         handler.postDelayed(cycleWatchdogRunnable, 15 * 60_000L)
-        if (!villageRefreshClosed || villageRefreshInProgress || !villageRefreshCompleted) {
-            logEvent("Siklus: menunggu AUTO REFRESH VILLAGE ditutup sebelum Farm List/Resource Builder")
-            handler.postDelayed({ if (running) triggerScheduledCycle() }, 1_000L)
+        if (!villageRefreshCompleted && villageRefreshInProgress) {
+            logEvent("Siklus: Refresh Village masih berjalan; Farm List menunggu agar WebView tidak bentrok")
+            handler.postDelayed({ if (running) triggerScheduledCycleActions() }, 500L)
             return
         }
         triggerScheduledCycleActions()
@@ -1144,7 +1119,6 @@ class FarmAutomationService : Service() {
         if (records.isEmpty()) {
             villageRefreshCompleted = true
             villageRefreshInProgress = false
-            villageRefreshClosed = true
             logEvent("AUTO REFRESH VILLAGE: tidak ada village checklist; refresh dianggap selesai")
             if (initialCyclePending) {
                 initialCyclePending = false
@@ -1162,14 +1136,6 @@ class FarmAutomationService : Service() {
         villageRefreshInspectInFlight = false
         villageRefreshInProgress = true
         villageRefreshCompleted = false
-        villageRefreshClosed = false
-        villageRefreshStartedAt = System.currentTimeMillis()
-        handler.removeCallbacks(villageRefreshTimeoutRunnable)
-        villageRefreshTimeoutRunnable = Runnable {
-            if (running && villageRefreshInProgress) {
-                closeAutomaticVillageRefresh("TIMEOUT 2 MENIT — refresh ditutup paksa")
-            }
-        }.also { handler.postDelayed(it, 120_000L) }
         val selectedIds = villageRefreshVillages.map { it.first }.toSet()
         val cleared = loadVillageDataRecordsFromPrefs().map {
             if (it.id in selectedIds) it.copy(linkResource = "", minLvl = -1) else it
@@ -1183,9 +1149,19 @@ class FarmAutomationService : Service() {
     private fun loadNextAutomaticVillageRefresh() {
         if (!running || !villageRefreshInProgress) return
         if (villageRefreshIndex >= villageRefreshVillages.size) {
+            villageRefreshInProgress = false
+            villageRefreshCompleted = true
             villageRefreshRetry = 0
             logEvent("AUTO REFRESH VILLAGE: selesai — ${villageRefreshVillages.size} village diperbarui")
-            closeAutomaticVillageRefresh("semua village checklist selesai")
+            updateNotification("Refresh Village selesai — data resource terbaru tersimpan")
+            if (initialCyclePending) {
+                initialCyclePending = false
+                countdownCyclePending = false
+                logEvent("AUTO REFRESH VILLAGE: siklus pertama siap dimulai")
+                triggerScheduledCycle()
+            } else {
+                maybeStartResourceBuilderAfterRefresh()
+            }
             return
         }
         val (id, name) = villageRefreshVillages[villageRefreshIndex]
@@ -1217,6 +1193,35 @@ class FarmAutomationService : Service() {
                 const anchors = [...container.querySelectorAll('a[href*="build.php?id="]')];
                 const candidates = [];
                 const seen = new Set();
+                const inferResourceType = (a) => {
+                    const nodes = []; let n = a;
+                    for (let depth=0; depth<10 && n; depth++, n=n.parentElement) nodes.push(n);
+                    const parts=[];
+                    for (const node of nodes) {
+                        parts.push(node.getAttribute?.('data-resource-type')||'', node.getAttribute?.('data-resource')||'', node.getAttribute?.('title')||'', node.getAttribute?.('aria-label')||'', String(node.className||''), clean(node.innerText||node.textContent||''));
+                        for (const img of node.querySelectorAll?.('img[alt],img[src]')||[]) parts.push(img.getAttribute('alt')||'', img.getAttribute('src')||'');
+                    }
+                    const text=parts.join(' ').toLowerCase();
+                    // fieldId (id=1..18) is only the field position. It does NOT
+                    // identify the resource type. Prefer Travian's structural g1..g4
+                    // / data-gid markers; only then fall back to visible text.
+                    const resourceClass = nodes.map(node => String(node.className || '')).join(' ').toLowerCase();
+                    const gidAttrs = nodes.map(node => [
+                        node.getAttribute?.('data-gid') || '',
+                        node.getAttribute?.('data-resource-id') || '',
+                        node.getAttribute?.('data-resource-type') || ''
+                    ].join(' ')).join(' ').toLowerCase();
+                    const structural = resourceClass + ' ' + gidAttrs;
+                    if (/(?:^|\s)g1(?:\s|$)/.test(structural)) return 'Wood';
+                    if (/(?:^|\s)g2(?:\s|$)/.test(structural)) return 'Clay';
+                    if (/(?:^|\s)g3(?:\s|$)/.test(structural)) return 'Iron';
+                    if (/(?:^|\s)g4(?:\s|$)/.test(structural)) return 'Crop';
+                    if (/lumber|wood|holz|bois|madera|timber/.test(text)) return 'Wood';
+                    if (/clay|lehm|argile|arcilla/.test(text)) return 'Clay';
+                    if (/iron|eisen|fer|hierro/.test(text)) return 'Iron';
+                    if (/crop|wheat|cereal|getreide|blé|cereales/.test(text)) return 'Crop';
+                    return '';
+                };
                 for (const a of anchors) {
                     const hrefRaw = a.getAttribute('href') || '';
                     const m = hrefRaw.match(/[?&]id=(\d+)/i);
@@ -1232,9 +1237,10 @@ class FarmAutomationService : Service() {
                         if(lm){level=parseInt(lm[1],10);break;}
                     }
                     const disabled=a.classList.contains('disabled')||!!a.closest('.disabled')||a.getAttribute('aria-disabled')==='true'||a.getAttribute('data-disabled')==='true';
+                    const resourceType=inferResourceType(a);
                     const absoluteHref=new URL(hrefRaw, location.href);
                     absoluteHref.searchParams.set('gid','1');
-                    candidates.push({fieldId,level,href:absoluteHref.href,disabled});
+                    candidates.push({fieldId,level,href:absoluteHref.href,disabled,resourceType});
                 }
                 candidates.sort((a,b)=>(a.level>=0?a.level:999)-(b.level>=0?b.level:999)||a.fieldId-b.fieldId);
                 const lowest = candidates.find(x => !x.disabled && x.level >= 0 && x.level < 10) || null;
@@ -1265,13 +1271,7 @@ class FarmAutomationService : Service() {
             val minLevel = lowest?.optInt("level", json.optInt("minLevel", -1)) ?: json.optInt("minLevel", -1)
             val records = loadVillageDataRecordsFromPrefs().toMutableList()
             val pos = records.indexOfFirst { it.id == expectedId }
-            if (minLevel >= 10) {
-                if (pos >= 0) {
-                    records.removeAt(pos)
-                    saveVillageDataRecordsForService(records)
-                }
-                logEvent("AUTO REFRESH VILLAGE: $expectedName dihapus dari DATABASE — MinLvl=L$minLevel (>=10)")
-            } else if (pos >= 0 && href.isNotBlank() && minLevel >= 0) {
+            if (pos >= 0) {
                 val old = records[pos]
                 records[pos] = old.copy(
                     namaVillage = json.optString("name").trim().ifBlank { expectedName },
@@ -1280,10 +1280,9 @@ class FarmAutomationService : Service() {
                     minLvl = minLevel
                 )
                 saveVillageDataRecordsForService(records)
-                logEvent("AUTO REFRESH VILLAGE: $expectedName updated — min=L$minLevel id=${lowest?.optString("fieldId").orEmpty()} target=$href")
-            } else {
-                logEvent("AUTO REFRESH VILLAGE: $expectedName target tidak valid — min=L$minLevel id=${lowest?.optString("fieldId").orEmpty()}")
             }
+            val targetType = lowest?.optString("resourceType").orEmpty().ifBlank { "Resource" }
+            logEvent("AUTO REFRESH VILLAGE: $expectedName updated — min=L$minLevel type=$targetType target=${href.ifBlank { "-" }}")
             villageRefreshIndex++
             handler.postDelayed({ loadNextAutomaticVillageRefresh() }, 500L)
         }
@@ -1409,16 +1408,73 @@ class FarmAutomationService : Service() {
     private fun openSavedBuilderResource(): Unit {
         debugTrace("ENTER openSavedBuilderResource")
         if (!running || !builderInProgress || pendingBuilderResourceHref.isBlank()) return
-        val (villageId, villageName) = builderVillages.getOrNull(builderVillageIndex) ?: return
-        var href = absoluteBuilderHref(pendingBuilderResourceHref)
-        if (!Regex("[?&]newdid=\\d+", RegexOption.IGNORE_CASE).containsMatchIn(href)) {
-            href += if (href.contains("?")) "&newdid=$villageId" else "?newdid=$villageId"
-        }
+        val (villageId, villageName) = builderVillages.getOrNull(builderVillageIndex)
+            ?: return
+        val expectedId = villageId
+        val href = absoluteBuilderHref(pendingBuilderResourceHref)
+        val hrefJson = JSONObject.quote(href)
         builderStage = "OPEN_RESOURCE"
-        builderVillageClickInProgress = false
-        val fieldId = Regex("[?&]id=(\\d+)", RegexOption.IGNORE_CASE).find(href)?.groupValues?.getOrNull(1).orEmpty()
-        logEvent("Resource Builder: $villageName — masuk langsung ke target resource id=$fieldId href=$href")
-        automationWebView()?.loadUrl(href)
+        val idJson = JSONObject.quote(expectedId)
+
+        val js = """
+            (() => {
+                const id = $idJson;
+                const targetHref = $hrefJson;
+                const current = location.href.match(/[?&]newdid=(\d+)/i)?.[1] || '';
+                if (current !== id) return JSON.stringify({state:'wrong_village', current, expected:id});
+
+                // Pastikan target href yang tersimpan memang berasal dari village ini.
+                const anchors = [...document.querySelectorAll('#resourceFieldContainer a[href*="build.php?id="], a[href*="build.php?id="]')];
+                const wanted = targetHref.split('#')[0];
+                const found = anchors.find(a => {
+                    const raw = a.getAttribute('href') || '';
+                    return raw === targetHref || raw === wanted || a.href === targetHref || a.href === wanted;
+                });
+
+                if (found) {
+                    found.scrollIntoView({block:'center'});
+                    found.click();
+                    return JSON.stringify({state:'clicked', href:found.getAttribute('href') || found.href});
+                }
+
+                // Jika skin Travian tidak merender anchor resource di DOM, gunakan
+                // href tersimpan secara langsung. Ini tetap menuju field yang sama.
+                location.href = targetHref;
+                return JSON.stringify({state:'load_saved_href', href:targetHref});
+            })();
+        """.trimIndent()
+
+        automationWebView()?.evaluateJavascript(js) { raw ->
+            val result = raw.orEmpty().trim('"').replace("\\\"", "\"")
+            when {
+                result.contains("wrong_village") -> {
+                    logEvent("Resource Builder: village aktif salah saat membuka target; expected=$expectedId; retry")
+                    if (builderAttempt < 4) {
+                        builderAttempt++
+                        automationWebView()?.loadUrl("$server/dorf1.php")
+                    } else {
+                        builderVillageClickInProgress = false
+                        pendingBuilderResourceHref = ""
+                        goToNextBuilderVillage()
+                    }
+                }
+                result.contains("clicked") || result.contains("load_saved_href") -> {
+                    builderVillageClickInProgress = false
+                    logEvent("Resource Builder: $villageName — membuka target resource tersimpan $href")
+                }
+                else -> {
+                    if (builderAttempt < 4) {
+                        builderAttempt++
+                        handler.postDelayed({ openSavedBuilderResource() }, 700)
+                    } else {
+                        builderVillageClickInProgress = false
+                        pendingBuilderResourceHref = ""
+                        logEvent("Resource Builder: gagal membuka target resource tersimpan untuk $villageName")
+                        goToNextBuilderVillage()
+                    }
+                }
+            }
+        }
     }
 
     private fun saveDebugResourceBuilderVillageLink(villageId: String, savedVillageHref: String = "") {
@@ -1677,103 +1733,13 @@ class FarmAutomationService : Service() {
                     val total = pendingUpgradeCosts.sum()
                     logEvent("Resource Builder: resource village kurang; kebutuhan inventory=${pendingUpgradeCosts.joinToString(",")}, total=$total")
                     inventoryUseAttempt = 0
-                    updateNotification("Resource Builder — transfer resource Hero")
-                    clickRedResourceForTransfer()
+                    updateNotification("Resource Builder — mengambil resource Hero")
+                    automationWebView()?.loadUrl("$server/hero/inventory")
                 }
                 else -> {
                     logEvent("Resource Builder: biaya upgrade tidak terbaca; village dilewati")
                     goToNextBuilderVillage()
                 }
-            }
-        }
-    }
-
-    private fun clickRedResourceForTransfer() {
-        debugTrace("ENTER clickRedResourceForTransfer")
-        if (!running || !builderInProgress || pendingUpgradeUrl.isBlank()) return
-        val needed = pendingUpgradeCosts.joinToString(",")
-        val js = """
-            (() => {
-                const needed = [$needed];
-                const visible = el => {
-                    if (!el) return false;
-                    const s = getComputedStyle(el), r = el.getBoundingClientRect();
-                    return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
-                };
-                const all = [...document.querySelectorAll('[onclick*="openResourceTransfer"],[data-react-click*="openResourceTransfer"],a,button,[role="button"]')]
-                    .filter(visible);
-                const deficitIndex = needed.findIndex(v => Number(v) > 0);
-                const score = el => {
-                    const raw = ((el.getAttribute('onclick') || '') + ' ' + (el.getAttribute('data-react-click') || '') + ' ' + (el.className || '') + ' ' + (el.getAttribute('data-resource') || '')).toLowerCase();
-                    let n = 0;
-                    if (raw.includes('openresourcetransfer')) n += 100;
-                    if (/red|negative|insufficient|missing|shortage/.test(raw)) n += 50;
-                    if (deficitIndex >= 0 && raw.includes('r' + (deficitIndex + 1))) n += 20;
-                    return n;
-                };
-                const direct = all.filter(el => /openResourceTransfer/i.test((el.getAttribute('onclick') || '') + ' ' + (el.getAttribute('data-react-click') || '')))
-                    .sort((a,b) => score(b)-score(a));
-                const red = all.filter(el => /red|negative|insufficient|missing|shortage/.test(((el.className || '') + ' ' + (el.getAttribute('data-resource') || '') + ' ' + (el.getAttribute('aria-label') || '')).toLowerCase()))
-                    .sort((a,b) => score(b)-score(a));
-                const target = direct[0] || red[0];
-                if (!target) return 'not-found';
-                target.scrollIntoView({block:'center'});
-                target.click();
-                return 'clicked';
-            })();
-        """.trimIndent()
-        automationWebView()?.evaluateJavascript(js) { raw ->
-            val result = raw.orEmpty().trim('"').replace("\\\"", "\"")
-            if (result == "clicked") {
-                logEvent("Resource Builder: elemen RED/openResourceTransfer diklik; menunggu dialog Transfer selected")
-                inventoryUseAttempt = 0
-                handler.postDelayed({ clickTransferSelected() }, 500L)
-            } else if (inventoryUseAttempt < 6) {
-                inventoryUseAttempt++
-                handler.postDelayed({ clickRedResourceForTransfer() }, 700L)
-            } else {
-                logEvent("Resource Builder: tombol resource RED/openResourceTransfer tidak ditemukan")
-                pendingUpgradeUrl = ""
-                pendingUpgradeCosts = longArrayOf(0L,0L,0L,0L)
-                goToNextBuilderVillage()
-            }
-        }
-    }
-
-    private fun clickTransferSelected() {
-        debugTrace("ENTER clickTransferSelected")
-        if (!running || !builderInProgress || pendingUpgradeUrl.isBlank()) return
-        val js = """
-            (() => {
-                const visible = el => {
-                    if (!el) return false;
-                    const s = getComputedStyle(el), r = el.getBoundingClientRect();
-                    return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
-                };
-                const norm = s => String(s || '').replace(/\s+/g,' ').trim().toLowerCase();
-                const all = [...document.querySelectorAll('button,a,input[type=submit],input[type=button],[role="button"]')]
-                    .filter(visible);
-                const btn = all.find(el => /transfer\s+selected/i.test(norm(el.innerText || el.textContent || el.value || el.title || el.getAttribute('aria-label'))));
-                if (!btn) return 'not-found';
-                btn.scrollIntoView({block:'center'});
-                btn.click();
-                return 'clicked';
-            })();
-        """.trimIndent()
-        automationWebView()?.evaluateJavascript(js) { raw ->
-            val result = raw.orEmpty().trim('"').replace("\\\"", "\"")
-            if (result == "clicked") {
-                logEvent("Resource Builder: Transfer selected diklik")
-                val url = pendingUpgradeUrl
-                handler.postDelayed({ automationWebView()?.loadUrl(url) }, 900L)
-            } else if (inventoryUseAttempt < 8) {
-                inventoryUseAttempt++
-                handler.postDelayed({ clickTransferSelected() }, 500L)
-            } else {
-                logEvent("Resource Builder: dialog Transfer selected tidak ditemukan")
-                pendingUpgradeUrl = ""
-                pendingUpgradeCosts = longArrayOf(0L,0L,0L,0L)
-                goToNextBuilderVillage()
             }
         }
     }
@@ -2326,17 +2292,15 @@ class FarmAutomationService : Service() {
         val chosenMinutes = if (maxMinutes <= minMinutes) minMinutes
         else Random.nextLong(minMinutes, maxMinutes + 1)
         val delay = chosenMinutes * 60_000L
-        val countdownStartedAt = System.currentTimeMillis()
-        nextAt = countdownStartedAt + delay
+        nextAt = System.currentTimeMillis() + delay
         updateNextRun(delay)
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-            .putBoolean("cycle_active", false)
-            .putLong("countdown_started_at", countdownStartedAt)
-            .apply()
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean("cycle_active", false).apply()
         handler.removeCallbacks(nextRunRunnable)
         handler.postDelayed(nextRunRunnable, delay)
-        scheduleVillageRefreshForNextRun(countdownStartedAt)
-        logEvent("Countdown dimulai: $chosenMinutes menit; Refresh Village=${timeFormat.format(Date(countdownStartedAt + 60_000L))}; Next Run=${timeFormat.format(Date(nextAt))}")
+        // Setiap countdown berikutnya selalu diikuti Refresh Village tepat 1 menit
+        // setelah countdown dimulai (atau segera bila interval <= 1 menit).
+        scheduleVillageRefreshForNextRun(nextAt)
+        logEvent("Countdown dimulai: $chosenMinutes menit; Next Run=${timeFormat.format(Date(nextAt))}")
         updateNotification("Next Run ${timeFormat.format(Date(nextAt))} | dalam ${formatDuration(delay)}")
     }
 
